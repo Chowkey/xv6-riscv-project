@@ -120,3 +120,14 @@ sys_getprocs(void)
 
   return getprocs(addr, n);
 }
+
+uint64
+sys_trace(void)
+{
+  int mask;
+
+  argint(0, &mask);
+  myproc()->tracemask = mask;
+
+  return 0;
+}
