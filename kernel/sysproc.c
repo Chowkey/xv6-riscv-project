@@ -124,7 +124,9 @@ sys_getprocs(void)
 uint64
 sys_mmap(void)
 {
-  return mmap();
+  int key;
+  argint(0, &key);
+  return mmap(key);
 }
 
 uint64

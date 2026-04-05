@@ -138,9 +138,11 @@ int             fetchaddr(uint64, uint64*);
 void            syscall();
 
 void            init_shmem(void);
+void            proc_shmem_init(struct proc *);
+void            shmem_unmap_all(struct proc *);
 uint64          sys_mmap(void);
-uint64           sys_munmap(void);
-uint64          mmap(void);
+uint64          sys_munmap(void);
+uint64          mmap(int key);
 int             munmap(uint64 va);
 
 // trap.c

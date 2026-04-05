@@ -147,6 +147,9 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  // Initialize per-process shared memory state
+  proc_shmem_init(p);
+
   return p;
 }
 
@@ -282,6 +285,9 @@ kfork(void)
 
   np->tracemask = p->tracemask;
 
+  // Child starts with empty shmem mappings — it must call mmap(key) itself
+  proc_shmem_init(np);
+
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
 
@@ -333,6 +339,9 @@ kexit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // Unmap all shared memory regions before closing files
+  shmem_unmap_all(p);
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

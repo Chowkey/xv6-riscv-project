@@ -16,105 +16,244 @@ pagetable_t kernel_pagetable;
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
-// Structure to track our single shared memory page
-struct {
-  uint64 pa;              // Physical address of the shared page
-  int refcount;           // Reference count
-  struct spinlock lock;   // Lock to protect access
-  int allocated;          // Whether the page is allocated
-} shmem_page;
+// -----------------------------------------------------------------------
+// Shared Memory (mmap/munmap) — multi-region keyed implementation
+// -----------------------------------------------------------------------
+//
+// Design:
+//   Global table:  shmem_table[MAX_SHMEM]  — one entry per shared region.
+//     Each entry stores the physical address, reference count, key, and
+//     its own spinlock so independent regions never contend on each other.
+//
+//   Per-process:  proc->shmem_mappings[MAX_PROC_SHMEM]
+//     Tracks (key, va) pairs for every region this process has mapped.
+//     proc->shmem_next_va is a bump pointer for dynamic VA assignment;
+//     it starts at SHMEM_BASE and advances one page per mapping.
+//
+// Virtual address layout (user space):
+//   [0 .. p->sz)        normal process heap/stack
+//   [SHMEM_BASE ..)     shared memory window — grows upward
+//
+// Key semantics:
+//   Two processes that call mmap() with the same key share the same
+//   physical page.  A key of 0 is invalid; keys 1..INT_MAX are valid.
+// -----------------------------------------------------------------------
 
-// Define a specific region for shared memory
-#define SHMEM_REGION 0x4000000  // 64MB mark
+#define SHMEM_BASE 0x4000000UL  // 64 MB — start of shared-memory window
 
-static void
-shmem_drop_ref(uint64 pa)
-{
-  acquire(&shmem_page.lock);
-  if(shmem_page.allocated && shmem_page.pa == pa){
-    shmem_page.refcount--;
-    if(shmem_page.refcount == 0){
-      kfree((void *)shmem_page.pa);
-      shmem_page.pa = 0;
-      shmem_page.allocated = 0;
-    }
-  }
-  release(&shmem_page.lock);
-}
+// One entry in the global shared-region table
+struct shmem_entry {
+  int    key;        // >0 means allocated; 0 means free
+  uint64 pa;         // physical address of the shared page
+  int    refcount;   // number of processes that have mapped this region
+  struct spinlock lock;
+};
 
+static struct shmem_entry shmem_table[MAX_SHMEM];
+static struct spinlock     shmem_table_lock;  // protects allocation/search
+
+// Called once at boot (before kvminit)
 void
 init_shmem(void)
 {
-  initlock(&shmem_page.lock, "shmem");
-  shmem_page.pa = 0;
-  shmem_page.refcount = 0;
-  shmem_page.allocated = 0;
+  initlock(&shmem_table_lock, "shmem_tbl");
+  for(int i = 0; i < MAX_SHMEM; i++){
+    initlock(&shmem_table[i].lock, "shmem_entry");
+    shmem_table[i].key      = 0;
+    shmem_table[i].pa       = 0;
+    shmem_table[i].refcount = 0;
+  }
 }
 
+// Called from allocproc() to initialize a new process's shmem state
+void
+proc_shmem_init(struct proc *p)
+{
+  for(int i = 0; i < MAX_PROC_SHMEM; i++){
+    p->shmem_mappings[i].key = -1;
+    p->shmem_mappings[i].va  = 0;
+  }
+  p->shmem_next_va = SHMEM_BASE;
+}
+
+// Find the global table entry for a key (caller must hold shmem_table_lock)
+static struct shmem_entry *
+shmem_find_entry(int key)
+{
+  for(int i = 0; i < MAX_SHMEM; i++)
+    if(shmem_table[i].key == key)
+      return &shmem_table[i];
+  return 0;
+}
+
+// Map the shared region identified by `key` into the calling process.
+// Returns the virtual address the region is mapped at, or 0 on failure.
 uint64
-mmap(void)
+mmap(int key)
 {
   struct proc *p;
-  pte_t *pte;
-  uint64 pa;
+  struct shmem_entry *entry;
+  uint64 va, pa;
+  int slot;
+
+  if(key <= 0)
+    return 0;
 
   p = myproc();
-  pte = walk(p->pagetable, SHMEM_REGION, 0);
-  if(pte && (*pte & PTE_V)){
-    acquire(&shmem_page.lock);
-    if(shmem_page.allocated && PTE2PA(*pte) == shmem_page.pa){
-      release(&shmem_page.lock);
-      return SHMEM_REGION;
-    }
-    release(&shmem_page.lock);
-    return 0;
-  }   
 
-  acquire(&shmem_page.lock);
-  if(!shmem_page.allocated){
+  // --- Check if this process already mapped this key ---
+  for(int i = 0; i < MAX_PROC_SHMEM; i++){
+    if(p->shmem_mappings[i].key == key)
+      return p->shmem_mappings[i].va;  // idempotent: return existing mapping
+  }
+
+  // --- Find a free slot in the process mapping table ---
+  slot = -1;
+  for(int i = 0; i < MAX_PROC_SHMEM; i++){
+    if(p->shmem_mappings[i].key == -1){
+      slot = i;
+      break;
+    }
+  }
+  if(slot == -1)
+    return 0;  // process has too many shmem mappings
+
+  // --- Look up or create the global entry for this key ---
+  acquire(&shmem_table_lock);
+
+  entry = shmem_find_entry(key);
+  if(entry == 0){
+    // First process to request this key — allocate a new entry
+    for(int i = 0; i < MAX_SHMEM; i++){
+      if(shmem_table[i].key == 0){
+        entry = &shmem_table[i];
+        break;
+      }
+    }
+    if(entry == 0){
+      release(&shmem_table_lock);
+      return 0;  // global table full
+    }
+    // Allocate physical page
     char *mem = kalloc();
     if(mem == 0){
-      release(&shmem_page.lock);
+      release(&shmem_table_lock);
       return 0;
     }
     memset(mem, 0, PGSIZE);
-    shmem_page.pa = (uint64)mem;
-    shmem_page.refcount = 1;
-    shmem_page.allocated = 1;
+    entry->key      = key;
+    entry->pa       = (uint64)mem;
+    entry->refcount = 1;
   } else {
-    shmem_page.refcount++;
+    // Existing region — bump refcount
+    acquire(&entry->lock);
+    entry->refcount++;
+    release(&entry->lock);
   }
-  pa = shmem_page.pa;
-  release(&shmem_page.lock);
+  pa = entry->pa;
+  release(&shmem_table_lock);
 
-  if(mappages(p->pagetable, SHMEM_REGION, PGSIZE, pa, PTE_R | PTE_W | PTE_U) != 0){
-    shmem_drop_ref(pa);
+  // --- Assign a virtual address from this process's shmem window ---
+  va = p->shmem_next_va;
+  p->shmem_next_va += PGSIZE;
+
+  // --- Map pa into the process page table ---
+  if(mappages(p->pagetable, va, PGSIZE, pa, PTE_R | PTE_W | PTE_U) != 0){
+    // Roll back refcount
+    acquire(&shmem_table_lock);
+    acquire(&entry->lock);
+    entry->refcount--;
+    if(entry->refcount == 0){
+      kfree((void *)entry->pa);
+      entry->pa  = 0;
+      entry->key = 0;
+    }
+    release(&entry->lock);
+    release(&shmem_table_lock);
+    p->shmem_next_va -= PGSIZE;
     return 0;
   }
 
-  return SHMEM_REGION;
+  // --- Record in per-process table ---
+  p->shmem_mappings[slot].key = key;
+  p->shmem_mappings[slot].va  = va;
+
+  return va;
 }
 
+// Unmap the shared region that is mapped at `addr` in the calling process.
+// Returns 0 on success, -1 on error.
 int
 munmap(uint64 addr)
 {
   struct proc *p;
+  struct shmem_entry *entry;
   pte_t *pte;
   uint64 pa;
-
-  if(addr != SHMEM_REGION)
-    return -1;
+  int slot;
+  int key;
 
   p = myproc();
+
+  // Find which key is at this address in the process's mapping table
+  slot = -1;
+  key  = -1;
+  for(int i = 0; i < MAX_PROC_SHMEM; i++){
+    if(p->shmem_mappings[i].key != -1 && p->shmem_mappings[i].va == addr){
+      slot = i;
+      key  = p->shmem_mappings[i].key;
+      break;
+    }
+  }
+  if(slot == -1)
+    return -1;  // not a shmem address owned by this process
+
+  // Verify the PTE is valid
   pte = walk(p->pagetable, addr, 0);
   if(pte == 0 || (*pte & PTE_V) == 0)
     return -1;
 
   pa = PTE2PA(*pte);
+
+  // Clear the PTE
   *pte = 0;
-  shmem_drop_ref(pa);
+
+  // Drop the reference in the global table
+  acquire(&shmem_table_lock);
+  entry = shmem_find_entry(key);
+  if(entry != 0){
+    acquire(&entry->lock);
+    entry->refcount--;
+    if(entry->refcount == 0){
+      kfree((void *)entry->pa);
+      entry->pa  = 0;
+      entry->key = 0;
+    }
+    release(&entry->lock);
+  } else {
+    // Orphaned page — free it directly
+    kfree((void *)pa);
+  }
+  release(&shmem_table_lock);
+
+  // Clear the per-process slot
+  p->shmem_mappings[slot].key = -1;
+  p->shmem_mappings[slot].va  = 0;
+
   return 0;
 }
+
+// Unmap ALL shared regions for a process — called on exit/exec.
+void
+shmem_unmap_all(struct proc *p)
+{
+  for(int i = 0; i < MAX_PROC_SHMEM; i++){
+    if(p->shmem_mappings[i].key != -1)
+      munmap(p->shmem_mappings[i].va);
+  }
+}
+
+
 
 // Make a direct-map page table for the kernel.
 pagetable_t

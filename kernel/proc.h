@@ -81,6 +81,12 @@ struct trapframe {
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+// Per-process record of a mapped shared memory region
+struct shmem_mapping {
+  int   key;    // key of the shared region (-1 = unused slot)
+  uint64 va;    // virtual address where it is mapped in this process
+};
+
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -104,5 +110,9 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
-  int tracemask;              // New varible for tracing syscalls
+  int tracemask;               // New variable for tracing syscalls
+
+  // Shared memory mappings for this process
+  struct shmem_mapping shmem_mappings[MAX_PROC_SHMEM];
+  uint64 shmem_next_va;        // Next virtual address to use for shmem mapping
 };
