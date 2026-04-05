@@ -16,101 +16,151 @@ pagetable_t kernel_pagetable;
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
-// Structure to track our single shared memory page
+// Shared memory region structure
+struct shm_region {
+  uint64 pa;              // Physical address
+  int key;                // Key to identify the region
+  int refcount;           // Number of processes mapping this region
+};
+
+// Global shared memory table
 struct {
-  uint64 pa;              // Physical address of the shared page
-  int refcount;           // Reference count
-  struct spinlock lock;   // Lock to protect access
-  int allocated;          // Whether the page is allocated
-} shmem_page;
+  struct spinlock lock;
+  struct shm_region regions[NSHM];
+} shm_table;
 
-
-static void
-shmem_drop_ref(uint64 pa)
+// Helper to find a shared memory region by key
+// Must be called with shm_table.lock held
+static int
+shm_find(int key)
 {
-  acquire(&shmem_page.lock);
-  if(shmem_page.allocated && shmem_page.pa == pa){
-    shmem_page.refcount--;
-    if(shmem_page.refcount == 0){
-      kfree((void *)shmem_page.pa);
-      shmem_page.pa = 0;
-      shmem_page.allocated = 0;
+  for(int i = 0; i < NSHM; i++){
+    if(shm_table.regions[i].refcount > 0 && shm_table.regions[i].key == key)
+      return i;
+  }
+  return -1;
+}
+
+// Decrease reference count and free if 0
+static void
+shm_drop_ref(int idx)
+{
+  acquire(&shm_table.lock);
+  if(idx >= 0 && idx < NSHM && shm_table.regions[idx].refcount > 0){
+    shm_table.regions[idx].refcount--;
+    if(shm_table.regions[idx].refcount == 0){
+      kfree((void*)shm_table.regions[idx].pa);
+      shm_table.regions[idx].pa = 0;
+      shm_table.regions[idx].key = 0;
     }
   }
-  release(&shmem_page.lock);
+  release(&shm_table.lock);
 }
 
 void
 init_shmem(void)
 {
-  initlock(&shmem_page.lock, "shmem");
-  shmem_page.pa = 0;
-  shmem_page.refcount = 0;
-  shmem_page.allocated = 0;
+  initlock(&shm_table.lock, "shm_table");
+  for(int i = 0; i < NSHM; i++){
+    shm_table.regions[i].pa = 0;
+    shm_table.regions[i].key = 0;
+    shm_table.regions[i].refcount = 0;
+  }
 }
 
 uint64
-mmap(void)
+mmap(int key)
 {
-  struct proc *p;
-  pte_t *pte;
-  uint64 pa;
+  struct proc *p = myproc();
+  int shm_idx = -1;
 
-  p = myproc();
-  pte = walk(p->pagetable, SHMEM_REGION, 0);
-  if(pte && (*pte & PTE_V)){
-    acquire(&shmem_page.lock);
-    if(shmem_page.allocated && PTE2PA(*pte) == shmem_page.pa){
-      release(&shmem_page.lock);
-      return SHMEM_REGION;
-    }
-    release(&shmem_page.lock);
-    return 0;
-  }   
+  // Check if process already has this key mapped
+  for(int i = 0; i < NSHM; i++){
+    if(p->shm[i].va != 0 && p->shm[i].key == key)
+      return p->shm[i].va;
+  }
 
-  acquire(&shmem_page.lock);
-  if(!shmem_page.allocated){
-    char *mem = kalloc();
-    if(mem == 0){
-      release(&shmem_page.lock);
-      return 0;
-    }
-    memset(mem, 0, PGSIZE);
-    shmem_page.pa = (uint64)mem;
-    shmem_page.refcount = 1;
-    shmem_page.allocated = 1;
+  acquire(&shm_table.lock);
+  shm_idx = shm_find(key);
+  if(shm_idx >= 0){
+    // Key exists, increment reference count
+    shm_table.regions[shm_idx].refcount++;
   } else {
-    shmem_page.refcount++;
+    // Key doesn't exist, try to create new region
+    for(int i = 0; i < NSHM; i++){
+      if(shm_table.regions[i].refcount == 0){
+        char *mem = kalloc();
+        if(mem == 0){
+          release(&shm_table.lock);
+          return 0;
+        }
+        memset(mem, 0, PGSIZE);
+        shm_table.regions[i].pa = (uint64)mem;
+        shm_table.regions[i].key = key;
+        shm_table.regions[i].refcount = 1;
+        shm_idx = i;
+        break;
+      }
+    }
   }
-  pa = shmem_page.pa;
-  release(&shmem_page.lock);
+  uint64 pa = (shm_idx >= 0) ? shm_table.regions[shm_idx].pa : 0;
+  release(&shm_table.lock);
 
-  if(mappages(p->pagetable, SHMEM_REGION, PGSIZE, pa, PTE_R | PTE_W | PTE_U) != 0){
-    shmem_drop_ref(pa);
+  if(shm_idx < 0) return 0;
+
+  // Find a free virtual address starting from 0x40000000
+  uint64 va = 0x40000000;
+  int mapping_idx = -1;
+  for(int i = 0; i < NSHM; i++){
+    if(p->shm[i].va == 0){
+      mapping_idx = i;
+      break;
+    }
+  }
+
+  if(mapping_idx < 0){
+    shm_drop_ref(shm_idx);
     return 0;
   }
 
-  return SHMEM_REGION;
+  // Find a free page in page table
+  while(va < MAXVA){
+    if(walkaddr(p->pagetable, va) == 0){
+      if(mappages(p->pagetable, va, PGSIZE, pa, PTE_R | PTE_W | PTE_U) == 0){
+        p->shm[mapping_idx].va = va;
+        p->shm[mapping_idx].key = key;
+        return va;
+      }
+    }
+    va += PGSIZE;
+  }
+
+  shm_drop_ref(shm_idx);
+  return 0;
 }
 
 int
-munmap(uint64 addr)
+munmap(uint64 va)
 {
-  struct proc *p;
-  pte_t *pte;
-  uint64 pa;
+  struct proc *p = myproc();
+  int shm_idx = -1;
+  int mapping_idx = -1;
 
-  if(addr != SHMEM_REGION)
-    return -1;
+  for(int i = 0; i < NSHM; i++){
+    if(p->shm[i].va == va){
+      int key = p->shm[i].key;
+      mapping_idx = i;
+      acquire(&shm_table.lock);
+      shm_idx = shm_find(key);
+      release(&shm_table.lock);
+      break;
+    }
+  }
 
-  p = myproc();
-  pte = walk(p->pagetable, addr, 0);
-  if(pte == 0 || (*pte & PTE_V) == 0)
-    return -1;
+  if(mapping_idx < 0 || shm_idx < 0) return -1;
 
-  pa = PTE2PA(*pte);
-  *pte = 0;
-  shmem_drop_ref(pa);
+  uvmunmap(p->pagetable, va, 1, 1);
+  // mapping_idx and shm metadata are cleared in uvmunmap
   return 0;
 }
 
@@ -302,11 +352,27 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       continue;
     if(do_free){
       uint64 pa = PTE2PA(*pte);
-      if (a == SHMEM_REGION) {
-        shmem_drop_ref(pa);
-      } else {
-        kfree((void*)pa);
+      int is_shm = 0;
+      struct proc *p = myproc();
+      if(p && p->pagetable == pagetable){
+        for(int i = 0; i < NSHM; i++){
+          if(p->shm[i].va == a){
+            int key = p->shm[i].key;
+            acquire(&shm_table.lock);
+            int idx = shm_find(key);
+            release(&shm_table.lock);
+            if(idx >= 0){
+              shm_drop_ref(idx);
+              is_shm = 1;
+            }
+            p->shm[i].va = 0;
+            p->shm[i].key = 0;
+            break;
+          }
+        }
       }
+      if(!is_shm)
+        kfree((void*)pa);
     }
     *pte = 0;
   }
@@ -409,18 +475,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       continue;   // physical page hasn't been allocated
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    
-    if (i == SHMEM_REGION) {
-      if(mappages(new, i, PGSIZE, pa, flags) != 0){
-        goto err;
-      }
-      acquire(&shmem_page.lock);
-      if(shmem_page.allocated && shmem_page.pa == pa){
-        shmem_page.refcount++;
-      }
-      release(&shmem_page.lock);
-      continue;
-    }
 
     if((mem = kalloc()) == 0)
       goto err;
@@ -430,29 +484,33 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       goto err;
     }
   }
-
-  // If SHMEM_REGION is outside the range [0, sz), handle it explicitly
-  if (sz <= SHMEM_REGION) {
-    if((pte = walk(old, SHMEM_REGION, 0)) != 0 && (*pte & PTE_V)) {
-      pa = PTE2PA(*pte);
-      flags = PTE_FLAGS(*pte);
-      if(mappages(new, SHMEM_REGION, PGSIZE, pa, flags) != 0) {
-        goto err;
-      }
-      acquire(&shmem_page.lock);
-      if(shmem_page.allocated && shmem_page.pa == pa) {
-        shmem_page.refcount++;
-      }
-      release(&shmem_page.lock);
-    }
-  }
-
   return 0;
 
  err:
   uvmunmap(new, 0, i / PGSIZE, 1);
-  uvmunmap(new, SHMEM_REGION, 1, 1);
   return -1;
+}
+
+// Copy shared memory mappings from parent to child
+void
+shm_copy(struct proc *old, struct proc *new)
+{
+  for(int i = 0; i < NSHM; i++){
+    if(old->shm[i].va != 0){
+      uint64 va = old->shm[i].va;
+      int key = old->shm[i].key;
+      uint64 pa = walkaddr(old->pagetable, va);
+      if(mappages(new->pagetable, va, PGSIZE, pa, PTE_R | PTE_W | PTE_U) == 0){
+        new->shm[i].va = va;
+        new->shm[i].key = key;
+        acquire(&shm_table.lock);
+        int idx = shm_find(key);
+        if(idx >= 0)
+          shm_table.regions[idx].refcount++;
+        release(&shm_table.lock);
+      }
+    }
+  }
 }
 
 // mark a PTE invalid for user access.

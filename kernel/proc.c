@@ -213,7 +213,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
-  uvmunmap(pagetable, SHMEM_REGION, 1, 1);
+  // Shared memory regions are unmapped in uvmunmap(..., do_free=1) called via uvmfree
   uvmfree(pagetable, sz);
 }
 
@@ -285,6 +285,9 @@ kfork(void)
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
+
+  // Copy shared memory mappings
+  shm_copy(p, np);
 
   // increment reference counts on open file descriptors.
   for(i = 0; i < NOFILE; i++)

@@ -26,7 +26,7 @@ int pause(int);
 int uptime(void);
 int getprocs(void*, int);
 int trace(int);
-uint64 mmap(void);
+uint64 mmap(int);
 int munmap(uint64);
 
 // ulib.c

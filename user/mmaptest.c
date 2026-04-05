@@ -11,7 +11,7 @@ main(int argc, char *argv[])
   printf("Testing mmap shared memory...\n");
 
   // Map shared memory
-  shared_addr = mmap();
+  shared_addr = mmap(0);
   if(shared_addr == 0){
     printf("mmap failed\n");
     exit(1);

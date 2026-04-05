@@ -81,6 +81,12 @@ struct trapframe {
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+// Shared memory mapping per process
+struct shm_mapping {
+  uint64 va;   // Virtual address
+  int key;     // Key of the shared region
+};
+
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -105,4 +111,5 @@ struct proc {
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
   int tracemask;              // New varible for tracing syscalls
+  struct shm_mapping shm[NSHM]; // Shared memory mappings
 };
