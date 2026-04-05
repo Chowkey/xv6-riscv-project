@@ -16,6 +16,105 @@ pagetable_t kernel_pagetable;
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
+// Structure to track our single shared memory page
+struct {
+  uint64 pa;              // Physical address of the shared page
+  int refcount;           // Reference count
+  struct spinlock lock;   // Lock to protect access
+  int allocated;          // Whether the page is allocated
+} shmem_page;
+
+// Define a specific region for shared memory
+#define SHMEM_REGION 0x4000000  // 64MB mark
+
+static void
+shmem_drop_ref(uint64 pa)
+{
+  acquire(&shmem_page.lock);
+  if(shmem_page.allocated && shmem_page.pa == pa){
+    shmem_page.refcount--;
+    if(shmem_page.refcount == 0){
+      kfree((void *)shmem_page.pa);
+      shmem_page.pa = 0;
+      shmem_page.allocated = 0;
+    }
+  }
+  release(&shmem_page.lock);
+}
+
+void
+init_shmem(void)
+{
+  initlock(&shmem_page.lock, "shmem");
+  shmem_page.pa = 0;
+  shmem_page.refcount = 0;
+  shmem_page.allocated = 0;
+}
+
+uint64
+mmap(void)
+{
+  struct proc *p;
+  pte_t *pte;
+  uint64 pa;
+
+  p = myproc();
+  pte = walk(p->pagetable, SHMEM_REGION, 0);
+  if(pte && (*pte & PTE_V)){
+    acquire(&shmem_page.lock);
+    if(shmem_page.allocated && PTE2PA(*pte) == shmem_page.pa){
+      release(&shmem_page.lock);
+      return SHMEM_REGION;
+    }
+    release(&shmem_page.lock);
+    return 0;
+  }   
+
+  acquire(&shmem_page.lock);
+  if(!shmem_page.allocated){
+    char *mem = kalloc();
+    if(mem == 0){
+      release(&shmem_page.lock);
+      return 0;
+    }
+    memset(mem, 0, PGSIZE);
+    shmem_page.pa = (uint64)mem;
+    shmem_page.refcount = 1;
+    shmem_page.allocated = 1;
+  } else {
+    shmem_page.refcount++;
+  }
+  pa = shmem_page.pa;
+  release(&shmem_page.lock);
+
+  if(mappages(p->pagetable, SHMEM_REGION, PGSIZE, pa, PTE_R | PTE_W | PTE_U) != 0){
+    shmem_drop_ref(pa);
+    return 0;
+  }
+
+  return SHMEM_REGION;
+}
+
+int
+munmap(uint64 addr)
+{
+  struct proc *p;
+  pte_t *pte;
+  uint64 pa;
+
+  if(addr != SHMEM_REGION)
+    return -1;
+
+  p = myproc();
+  pte = walk(p->pagetable, addr, 0);
+  if(pte == 0 || (*pte & PTE_V) == 0)
+    return -1;
+
+  pa = PTE2PA(*pte);
+  *pte = 0;
+  shmem_drop_ref(pa);
+  return 0;
+}
 
 // Make a direct-map page table for the kernel.
 pagetable_t
