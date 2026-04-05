@@ -24,8 +24,6 @@ struct {
   int allocated;          // Whether the page is allocated
 } shmem_page;
 
-// Define a specific region for shared memory
-#define SHMEM_REGION 0x4000000  // 64MB mark
 
 static void
 shmem_drop_ref(uint64 pa)
@@ -304,7 +302,11 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       continue;
     if(do_free){
       uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+      if (a == SHMEM_REGION) {
+        shmem_drop_ref(pa);
+      } else {
+        kfree((void*)pa);
+      }
     }
     *pte = 0;
   }
@@ -407,6 +409,19 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       continue;   // physical page hasn't been allocated
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
+    
+    if (i == SHMEM_REGION) {
+      if(mappages(new, i, PGSIZE, pa, flags) != 0){
+        goto err;
+      }
+      acquire(&shmem_page.lock);
+      if(shmem_page.allocated && shmem_page.pa == pa){
+        shmem_page.refcount++;
+      }
+      release(&shmem_page.lock);
+      continue;
+    }
+
     if((mem = kalloc()) == 0)
       goto err;
     memmove(mem, (char*)pa, PGSIZE);
@@ -415,10 +430,28 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       goto err;
     }
   }
+
+  // If SHMEM_REGION is outside the range [0, sz), handle it explicitly
+  if (sz <= SHMEM_REGION) {
+    if((pte = walk(old, SHMEM_REGION, 0)) != 0 && (*pte & PTE_V)) {
+      pa = PTE2PA(*pte);
+      flags = PTE_FLAGS(*pte);
+      if(mappages(new, SHMEM_REGION, PGSIZE, pa, flags) != 0) {
+        goto err;
+      }
+      acquire(&shmem_page.lock);
+      if(shmem_page.allocated && shmem_page.pa == pa) {
+        shmem_page.refcount++;
+      }
+      release(&shmem_page.lock);
+    }
+  }
+
   return 0;
 
  err:
   uvmunmap(new, 0, i / PGSIZE, 1);
+  uvmunmap(new, SHMEM_REGION, 1, 1);
   return -1;
 }
 
