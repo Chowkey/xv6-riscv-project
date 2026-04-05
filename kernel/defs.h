@@ -137,6 +137,12 @@ int             fetchstr(uint64, char*, int);
 int             fetchaddr(uint64, uint64*);
 void            syscall();
 
+void            init_shmem(void);
+uint64          sys_mmap(void);
+uint64           sys_munmap(void);
+uint64          mmap(void);
+int             munmap(uint64 va);
+
 // trap.c
 extern uint     ticks;
 void            trapinit(void);

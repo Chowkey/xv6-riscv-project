@@ -17,6 +17,7 @@ main()
     printf("xv6 kernel is booting\n");
     printf("\n");
     kinit();         // physical page allocator
+    init_shmem();    // initialize global shared mmap page state
     kvminit();       // create kernel page table
     kvminithart();   // turn on paging
     procinit();      // process table
